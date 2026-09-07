@@ -35,6 +35,7 @@ class StepStatus(str, Enum):
 
 
 class TerminationReason(str, Enum):
+    MODEL_FINISH = "MODEL_FINISH"
     VERIFIED_COMPLETE = "VERIFIED_COMPLETE"
     CANCELLED = "CANCELLED"
     MAX_STEPS = "MAX_STEPS"
