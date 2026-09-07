@@ -1,0 +1,21 @@
+[
+  {
+    "type": "tool_call",
+    "tool_name": "list_files",
+    "arguments": {"path": "."}
+  },
+  {
+    "type": "tool_call",
+    "tool_name": "search_text",
+    "arguments": {"query": "discount", "path": "."}
+  },
+  {
+    "type": "tool_call",
+    "tool_name": "read_file",
+    "arguments": {"path": "src/order_service.py"}
+  },
+  {
+    "type": "finish",
+    "summary": "The discount logic is in src/order_service.py. Standard customers receive 0%, silver customers 5%, and gold customers 10%; unknown tiers receive 0%."
+  }
+]
