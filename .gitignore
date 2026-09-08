@@ -14,3 +14,4 @@ build/
 evaluation/results/*
 !evaluation/results/.gitkeep
 !evaluation/results/phase0_phase1_acceptance.md
+!evaluation/results/phase2_acceptance.md
