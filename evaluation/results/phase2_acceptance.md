@@ -1,6 +1,6 @@
 # Reliable Agent Runtime：Phase 2 工程验收报告
 
-## 0. 结论摘要（面试官速读）
+## 0. 结论摘要
 
 Phase 2 已完成“受控代码写入闭环”的工程目标：Runtime 可以连接真实的
 OpenAI-compatible 模型服务，让模型读取仓库、提交补丁、运行白名单测试与
