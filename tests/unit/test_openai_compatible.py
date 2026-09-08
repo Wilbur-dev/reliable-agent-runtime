@@ -4,7 +4,7 @@ import json
 import httpx
 import pytest
 
-from llm.errors import LLMAuthenticationError, LLMTimeoutError
+from llm.errors import LLMAuthenticationError, LLMConfigurationError, LLMTimeoutError
 from llm.openai_compatible import OpenAICompatibleClient
 from runtime.actions import FinishAction, ToolCallAction
 
@@ -46,6 +46,8 @@ def test_parses_openai_tool_call_and_usage() -> None:
         base_url="http://model.test/v1",
         api_key="secret",
         model="test-model",
+        input_cost_per_million=2.0,
+        output_cost_per_million=4.0,
         client=http_client,
     )
 
@@ -59,6 +61,8 @@ def test_parses_openai_tool_call_and_usage() -> None:
 
     assert response.action == ToolCallAction(tool_name="read_file", arguments={"path": "README.md"})
     assert response.usage.input_tokens == 10
+    assert response.usage.estimated_cost_usd == pytest.approx(0.000036)
+    assert response.raw_metadata["cost_rule"]["input_usd_per_million_tokens"] == 2.0
     assert response.raw_metadata["id"] == "response-1"
 
 
@@ -81,6 +85,16 @@ def test_plain_content_becomes_finish_action() -> None:
     asyncio.run(http_client.aclose())
 
     assert response.action == FinishAction(summary="Work complete")
+
+
+def test_negative_token_price_is_rejected() -> None:
+    with pytest.raises(LLMConfigurationError):
+        OpenAICompatibleClient(
+            base_url="http://model.test/v1",
+            api_key="",
+            model="test-model",
+            input_cost_per_million=-1,
+        )
 
 
 @pytest.mark.parametrize(

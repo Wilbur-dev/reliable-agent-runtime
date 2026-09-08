@@ -5,11 +5,14 @@ from collections.abc import Iterable
 from typing import Any
 
 from llm.base import LLMClient
+from llm.errors import LLMError
 from runtime.actions import FinishAction, LLMResponse, ToolCallAction
 
 
-class FakeLLMResponseExhaustedError(RuntimeError):
+class FakeLLMResponseExhaustedError(LLMError):
     """Raised when a fake client has no configured responses remaining."""
+
+    error_type = "fake_llm_response_exhausted"
 
 
 class FakeLLMClient(LLMClient):

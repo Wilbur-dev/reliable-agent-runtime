@@ -31,6 +31,8 @@ class OpenAICompatibleClient(LLMClient):
         timeout_seconds: float = 60,
         temperature: float = 0.0,
         max_output_tokens: int = 256,
+        input_cost_per_million: float = 0.0,
+        output_cost_per_million: float = 0.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         if not base_url or not model:
@@ -41,6 +43,10 @@ class OpenAICompatibleClient(LLMClient):
         self.timeout_seconds = timeout_seconds
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
+        if input_cost_per_million < 0 or output_cost_per_million < 0:
+            raise LLMConfigurationError("Token prices cannot be negative")
+        self.input_cost_per_million = input_cost_per_million
+        self.output_cost_per_million = output_cost_per_million
         self._client = client
 
     async def generate(
@@ -99,17 +105,28 @@ class OpenAICompatibleClient(LLMClient):
             message = choice["message"]
             action = self._parse_action(message)
             usage = body.get("usage") or {}
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+            estimated_cost = (
+                input_tokens * self.input_cost_per_million
+                + output_tokens * self.output_cost_per_million
+            ) / 1_000_000
             return LLMResponse(
                 action=action,
                 usage=LLMUsage(
-                    input_tokens=usage.get("prompt_tokens", 0),
-                    output_tokens=usage.get("completion_tokens", 0),
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    estimated_cost_usd=estimated_cost,
                 ),
                 latency_ms=latency_ms,
                 raw_metadata={
                     "id": body.get("id"),
                     "model": body.get("model", self.model),
                     "finish_reason": choice.get("finish_reason"),
+                    "cost_rule": {
+                        "input_usd_per_million_tokens": self.input_cost_per_million,
+                        "output_usd_per_million_tokens": self.output_cost_per_million,
+                    },
                 },
             )
         except (KeyError, IndexError, TypeError, ValueError, ValidationError) as exc:

@@ -55,6 +55,11 @@ class BudgetConfig(StrictModel):
     max_wall_time: float = Field(default=300.0, gt=0)
     max_tokens: int | None = Field(default=None, gt=0)
     max_cost_usd: float | None = Field(default=None, gt=0)
+    max_llm_retries: int = Field(default=2, ge=0)
+    retry_base_delay_seconds: float = Field(default=0.25, ge=0)
+    max_consecutive_failures: int = Field(default=3, gt=0)
+    max_repeated_actions: int = Field(default=3, gt=1)
+    max_no_progress_steps: int = Field(default=6, gt=1)
 
 
 class Task(StrictModel):
