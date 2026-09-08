@@ -4,7 +4,7 @@ A lightweight single-agent runtime built around explicit action schemas and cont
 
 ## Current milestone
 
-Phase 2 adds a controlled code-modification and verification loop:
+Phase 3 adds reliability controls around the code-modification and verification loop:
 
 - a validated tool registry;
 - workspace-scoped `list_files`, `search_text`, and `read_file` tools;
@@ -13,6 +13,11 @@ Phase 2 adds a controlled code-modification and verification loop:
 - deterministic verifiers that decide completion independently of the model;
 - an OpenAI-compatible client for cloud APIs and vLLM;
 - structured model usage, latency, step, tool, and verification traces.
+- step, tool-call, wall-time, token, and estimated-cost budgets;
+- bounded exponential backoff for retryable model errors;
+- action fingerprinting, repeated-action detection, consecutive-failure circuit breaking, and
+  no-progress termination;
+- explicit termination reasons and structured retry evidence.
 
 ## Run the phase 1 demo
 
@@ -69,6 +74,30 @@ reliable-agent \
 ```
 
 An empty API key is supported for local vLLM endpoints that do not require authentication.
+
+## Configure reliability budgets
+
+Budget limits are enforced by the Runtime, independently of model instructions:
+
+```bash
+reliable-agent \
+  --mode write \
+  --workspace /path/to/git-workspace \
+  --goal 'Fix the bug without modifying tests/.' \
+  --base-url https://api.example.com/v1 \
+  --model model-name \
+  --max-steps 20 \
+  --max-tool-calls 40 \
+  --max-wall-time 300 \
+  --max-tokens 20000 \
+  --max-cost-usd 0.50 \
+  --max-llm-retries 2 \
+  --input-cost-per-million 1.00 \
+  --output-cost-per-million 2.00
+```
+
+Prices are explicit USD-per-million-token inputs. They are never fetched implicitly, so historical
+experiments retain the estimation rule that produced their cost totals.
 
 ## Verify
 

@@ -70,7 +70,7 @@ def test_finish_requires_verification_and_failed_evidence_returns_to_agent(tmp_p
             SearchTextTool(),
             ReadFileTool(),
             ApplyPatchTool(),
-            RunTestsTool({"pytest": (sys.executable, "-m", "pytest", "-q")}),
+            RunTestsTool({"pytest": (sys.executable, "-B", "-m", "pytest", "-q")}),
             RunLinterTool({"compile": (sys.executable, "-m", "compileall", "-q", "src")}),
         ]
     )
