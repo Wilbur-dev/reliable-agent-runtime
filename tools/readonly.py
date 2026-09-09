@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -128,6 +129,7 @@ class ReadFileTool(ReadOnlyTool):
                 "start_line": args.start_line,
                 "line_count": len(selected),
                 "total_lines": len(lines),
+                "content_hash": hashlib.sha256(path.read_bytes()).hexdigest(),
             },
         )
 

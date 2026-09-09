@@ -107,6 +107,32 @@ class ApprovalRow(Base):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class ContextCompactionRow(Base):
+    __tablename__ = "context_compactions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id"), index=True)
+    step_sequence: Mapped[int] = mapped_column(Integer)
+    chars_before: Mapped[int] = mapped_column(Integer)
+    chars_after: Mapped[int] = mapped_column(Integer)
+    tokens_before: Mapped[int] = mapped_column(Integer)
+    tokens_after: Mapped[int] = mapped_column(Integer)
+    compacted_message_count: Mapped[int] = mapped_column(Integer)
+    summary: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class RuntimeEventRow(Base):
+    __tablename__ = "runtime_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id"), index=True)
+    step_sequence: Mapped[int | None] = mapped_column(Integer)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -393,6 +419,103 @@ class SQLiteStore:
                 select(ApprovalRow).where(ApprovalRow.task_id == task_id).order_by(ApprovalRow.id)
             ).all()
             return [self._approval_payload(row) for row in rows]
+
+    def save_context_compaction(
+        self,
+        task_id: str,
+        step_sequence: int,
+        *,
+        chars_before: int,
+        chars_after: int,
+        tokens_before: int,
+        tokens_after: int,
+        compacted_message_count: int,
+        summary: dict[str, Any],
+    ) -> None:
+        with self.sessions.begin() as session:
+            session.add(
+                ContextCompactionRow(
+                    task_id=task_id,
+                    step_sequence=step_sequence,
+                    chars_before=chars_before,
+                    chars_after=chars_after,
+                    tokens_before=tokens_before,
+                    tokens_after=tokens_after,
+                    compacted_message_count=compacted_message_count,
+                    summary=summary,
+                    created_at=utc_now(),
+                )
+            )
+
+    def list_context_compactions(self, task_id: str) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            rows = session.scalars(
+                select(ContextCompactionRow)
+                .where(ContextCompactionRow.task_id == task_id)
+                .order_by(ContextCompactionRow.id)
+            ).all()
+            return [
+                {
+                    "id": row.id,
+                    "step_sequence": row.step_sequence,
+                    "chars_before": row.chars_before,
+                    "chars_after": row.chars_after,
+                    "tokens_before": row.tokens_before,
+                    "tokens_after": row.tokens_after,
+                    "compacted_message_count": row.compacted_message_count,
+                    "summary": row.summary,
+                    "created_at": row.created_at.isoformat(),
+                }
+                for row in rows
+            ]
+
+    def record_event(
+        self,
+        task_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        step_sequence: int | None = None,
+    ) -> None:
+        with self.sessions.begin() as session:
+            session.add(
+                RuntimeEventRow(
+                    task_id=task_id,
+                    step_sequence=step_sequence,
+                    event_type=event_type,
+                    payload=payload,
+                    created_at=utc_now(),
+                )
+            )
+
+    def list_events(self, task_id: str) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            rows = session.scalars(
+                select(RuntimeEventRow)
+                .where(RuntimeEventRow.task_id == task_id)
+                .order_by(RuntimeEventRow.id)
+            ).all()
+            return [
+                {
+                    "id": row.id,
+                    "step_sequence": row.step_sequence,
+                    "event_type": row.event_type,
+                    "payload": row.payload,
+                    "created_at": row.created_at.isoformat(),
+                }
+                for row in rows
+            ]
+
+    def get_tool_output(self, task_id: str, result_id: str) -> str | None:
+        with self.sessions() as session:
+            rows = session.scalars(select(StepRow).where(StepRow.task_id == task_id)).all()
+            for row in rows:
+                if not row.result or not isinstance(row.result.get("output"), str):
+                    continue
+                output = row.result["output"]
+                if hashlib.sha256(output.encode()).hexdigest() == result_id:
+                    return output
+        return None
 
     @staticmethod
     def _approval_payload(row: ApprovalRow) -> dict[str, Any]:

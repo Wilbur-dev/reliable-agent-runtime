@@ -11,8 +11,10 @@ from llm.base import LLMClient
 from llm.errors import LLMError
 from policies.engine import PolicyDecision, PolicyEngine
 from runtime.actions import AgentAction, FinishAction, LLMUsage, ToolCallAction
+from runtime.context import ContextBuilder
 from runtime.control import RunawayDetector
 from runtime.models import Task, TaskStatus, TerminationReason, ToolResult
+from runtime.observability import JsonEventLogger
 from tools.base import ToolContext
 from tools.registry import ToolRegistry
 from verifiers.base import VerificationResult, Verifier
@@ -26,6 +28,7 @@ class AgentStepRecord(BaseModel):
     tool_result: ToolResult | None = None
     llm_usage: LLMUsage = Field(default_factory=LLMUsage)
     model_latency_ms: float = Field(default=0.0, ge=0)
+    tool_latency_ms: float = Field(default=0.0, ge=0)
     model_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -52,6 +55,9 @@ class AgentRunResult(BaseModel):
     total_estimated_cost_usd: float = Field(default=0.0, ge=0)
     llm_retry_count: int = Field(default=0, ge=0)
     retry_events: list[RetryEvent] = Field(default_factory=list)
+    context_compaction_count: int = Field(default=0, ge=0)
+    prompt_tokens_before_compaction: int = Field(default=0, ge=0)
+    prompt_tokens_after_compaction: int = Field(default=0, ge=0)
 
 
 class InMemoryAgentLoop:
@@ -71,6 +77,8 @@ class InMemoryAgentLoop:
         initial_tool_call_count: int = 0,
         history_steps: list[AgentStepRecord] | None = None,
         policy_engine: PolicyEngine | None = None,
+        context_builder: ContextBuilder | None = None,
+        event_logger: JsonEventLogger | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -85,6 +93,8 @@ class InMemoryAgentLoop:
         self.initial_tool_call_count = initial_tool_call_count
         self.history_steps = history_steps or []
         self.policy_engine = policy_engine
+        self.context_builder = context_builder
+        self.event_logger = event_logger or JsonEventLogger()
 
     async def run(self, task: Task) -> AgentRunResult:
         task.status = TaskStatus.RUNNING
@@ -118,6 +128,9 @@ class InMemoryAgentLoop:
         total_output_tokens = int(self.initial_metrics.get("output_tokens", 0))
         total_cost = float(self.initial_metrics.get("estimated_cost_usd", 0.0))
         llm_retry_count = int(self.initial_metrics.get("llm_retry_count", 0))
+        context_compaction_count = int(self.initial_metrics.get("context_compaction_count", 0))
+        prompt_tokens_before = int(self.initial_metrics.get("prompt_tokens_before_compaction", 0))
+        prompt_tokens_after = int(self.initial_metrics.get("prompt_tokens_after_compaction", 0))
         retry_events: list[RetryEvent] = []
         detector = RunawayDetector()
         prior_elapsed = float(self.initial_metrics.get("elapsed_seconds", 0.0))
@@ -145,6 +158,9 @@ class InMemoryAgentLoop:
                 total_estimated_cost_usd=total_cost,
                 llm_retry_count=llm_retry_count,
                 retry_events=retry_events,
+                context_compaction_count=context_compaction_count,
+                prompt_tokens_before_compaction=prompt_tokens_before,
+                prompt_tokens_after_compaction=prompt_tokens_after,
             )
             if self.checkpoint_store is not None:
                 self.checkpoint_store.replace_messages(str(task.id), messages)
@@ -160,8 +176,34 @@ class InMemoryAgentLoop:
                         "output_tokens": total_output_tokens,
                         "estimated_cost_usd": total_cost,
                         "llm_retry_count": llm_retry_count,
+                        "context_compaction_count": context_compaction_count,
+                        "prompt_tokens_before_compaction": prompt_tokens_before,
+                        "prompt_tokens_after_compaction": prompt_tokens_after,
                     },
                 )
+                self.checkpoint_store.record_event(
+                    str(task.id),
+                    "task_finished",
+                    {
+                        "status": task.status.value,
+                        "termination_reason": (
+                            task.termination_reason.value if task.termination_reason else None
+                        ),
+                        "elapsed_seconds": result.elapsed_seconds,
+                        "input_tokens": total_input_tokens,
+                        "output_tokens": total_output_tokens,
+                        "estimated_cost_usd": total_cost,
+                        "context_compaction_count": context_compaction_count,
+                    },
+                )
+            self.event_logger.emit(
+                "task_finished",
+                task_id=str(task.id),
+                status=task.status.value,
+                termination_reason=(
+                    task.termination_reason.value if task.termination_reason else None
+                ),
+            )
             return result
 
         start_sequence = self.sequence_offset + 1
@@ -180,8 +222,60 @@ class InMemoryAgentLoop:
             attempt = 0
             while True:
                 try:
+                    model_messages = messages
+                    if self.context_builder is not None:
+                        context_view = self.context_builder.build(
+                            messages, workspace=task.workspace
+                        )
+                        model_messages = context_view.messages
+                        prompt_tokens_before = context_view.estimated_tokens_before
+                        prompt_tokens_after = context_view.estimated_tokens_after
+                        if context_view.compacted:
+                            context_compaction_count += 1
+                            summary_message = next(
+                                (
+                                    message
+                                    for message in model_messages
+                                    if message.get("name") == "context_summary"
+                                ),
+                                {"content": {}},
+                            )
+                            if self.checkpoint_store is not None:
+                                self.checkpoint_store.save_context_compaction(
+                                    str(task.id),
+                                    sequence,
+                                    chars_before=context_view.chars_before,
+                                    chars_after=context_view.chars_after,
+                                    tokens_before=context_view.estimated_tokens_before,
+                                    tokens_after=context_view.estimated_tokens_after,
+                                    compacted_message_count=(context_view.compacted_message_count),
+                                    summary=summary_message["content"],
+                                )
+                                self.checkpoint_store.record_event(
+                                    str(task.id),
+                                    "context_compacted",
+                                    {
+                                        "tokens_before": context_view.estimated_tokens_before,
+                                        "tokens_after": context_view.estimated_tokens_after,
+                                        "compacted_message_count": (
+                                            context_view.compacted_message_count
+                                        ),
+                                        "result_ids": context_view.result_ids,
+                                        "stale_file_references": (
+                                            context_view.stale_file_references
+                                        ),
+                                    },
+                                    step_sequence=sequence,
+                                )
+                            self.event_logger.emit(
+                                "context_compacted",
+                                task_id=str(task.id),
+                                step_sequence=sequence,
+                                tokens_before=context_view.estimated_tokens_before,
+                                tokens_after=context_view.estimated_tokens_after,
+                            )
                     response = await self.llm_client.generate(
-                        messages=messages,
+                        messages=model_messages,
                         tools=self.tool_registry.schemas(),
                     )
                     break
@@ -200,6 +294,25 @@ class InMemoryAgentLoop:
                             delay_seconds=delay,
                         )
                     )
+                    self.event_logger.emit(
+                        "model_retry",
+                        task_id=str(task.id),
+                        step_sequence=sequence,
+                        attempt=attempt,
+                        error_type=exc.error_type,
+                        delay_seconds=delay,
+                    )
+                    if self.checkpoint_store is not None:
+                        self.checkpoint_store.record_event(
+                            str(task.id),
+                            "model_retry",
+                            {
+                                "attempt": attempt,
+                                "error_type": exc.error_type,
+                                "delay_seconds": delay,
+                            },
+                            step_sequence=sequence,
+                        )
                     if elapsed() + delay >= task.budget.max_wall_time:
                         task.status = TaskStatus.BUDGET_EXCEEDED
                         task.termination_reason = TerminationReason.MAX_WALL_TIME
@@ -210,6 +323,27 @@ class InMemoryAgentLoop:
             total_input_tokens += response.usage.input_tokens
             total_output_tokens += response.usage.output_tokens
             total_cost += response.usage.estimated_cost_usd
+            if self.checkpoint_store is not None:
+                self.checkpoint_store.record_event(
+                    str(task.id),
+                    "model_finished",
+                    {
+                        "model_latency_ms": response.latency_ms,
+                        "input_tokens": response.usage.input_tokens,
+                        "output_tokens": response.usage.output_tokens,
+                        "estimated_cost_usd": response.usage.estimated_cost_usd,
+                    },
+                    step_sequence=sequence,
+                )
+            self.event_logger.emit(
+                "model_finished",
+                task_id=str(task.id),
+                step_sequence=sequence,
+                model_latency_ms=response.latency_ms,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                estimated_cost_usd=response.usage.estimated_cost_usd,
+            )
             repeated_count = detector.observe_action(action)
 
             if repeated_count >= task.budget.max_repeated_actions:
@@ -319,6 +453,25 @@ class InMemoryAgentLoop:
                     context=context,
                     task_constraints=task.constraints,
                 )
+                if self.checkpoint_store is not None:
+                    self.checkpoint_store.record_event(
+                        str(task.id),
+                        "policy_decision",
+                        {
+                            "decision": policy_result.decision.value,
+                            "rule": policy_result.rule,
+                            "tool_name": action.tool_name,
+                        },
+                        step_sequence=sequence,
+                    )
+                self.event_logger.emit(
+                    "policy_decision",
+                    task_id=str(task.id),
+                    step_sequence=sequence,
+                    decision=policy_result.decision.value,
+                    rule=policy_result.rule,
+                    tool_name=action.tool_name,
+                )
                 if policy_result.decision is PolicyDecision.REQUIRE_APPROVAL:
                     approved = bool(
                         self.checkpoint_store
@@ -355,6 +508,7 @@ class InMemoryAgentLoop:
                 checkpoint_step_id = self.checkpoint_store.begin_step(
                     task, sequence, action, mutates=mutates
                 )
+            tool_started_at = self.clock()
             if policy_result and policy_result.decision is PolicyDecision.DENY:
                 result = ToolResult(
                     success=False,
@@ -368,6 +522,7 @@ class InMemoryAgentLoop:
                     action.arguments,
                     context,
                 )
+            tool_latency_ms = max(0.0, self.clock() - tool_started_at) * 1000
             steps.append(
                 AgentStepRecord(
                     sequence=sequence,
@@ -375,6 +530,7 @@ class InMemoryAgentLoop:
                     tool_result=result,
                     llm_usage=response.usage,
                     model_latency_ms=response.latency_ms,
+                    tool_latency_ms=tool_latency_ms,
                     model_metadata=response.raw_metadata,
                 )
             )
@@ -382,6 +538,28 @@ class InMemoryAgentLoop:
                 self.checkpoint_store.finish_step(
                     checkpoint_step_id, result, task=task, mutates=mutates
                 )
+                self.checkpoint_store.record_event(
+                    str(task.id),
+                    "tool_finished",
+                    {
+                        "tool_name": action.tool_name,
+                        "success": result.success,
+                        "error_type": result.error_type,
+                        "exit_code": result.exit_code,
+                        "tool_latency_ms": tool_latency_ms,
+                    },
+                    step_sequence=sequence,
+                )
+            self.event_logger.emit(
+                "tool_finished",
+                task_id=str(task.id),
+                step_sequence=sequence,
+                tool_name=action.tool_name,
+                success=result.success,
+                error_type=result.error_type,
+                exit_code=result.exit_code,
+                tool_latency_ms=tool_latency_ms,
+            )
             consecutive_failures, no_progress_steps = detector.observe_result(action, result)
             messages.extend(
                 [
