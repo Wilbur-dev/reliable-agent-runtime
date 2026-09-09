@@ -1,0 +1,20 @@
+services:
+  runtime:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.runtime
+    ports:
+      - "8080:8080"
+    volumes:
+      - runtime-data:/data
+      - ./examples:/app/examples:ro
+    environment:
+      DATABASE_URL: sqlite:////data/reliable_agent.db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  runtime-data:
