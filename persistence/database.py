@@ -92,6 +92,21 @@ class VerificationResultRow(Base):
     metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JSON)
 
 
+class ApprovalRow(Base):
+    __tablename__ = "approvals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id"), index=True)
+    step_id: Mapped[int] = mapped_column(ForeignKey("steps.id"), unique=True)
+    action_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    rule: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(Text)
+    rejection_reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -256,6 +271,143 @@ class SQLiteStore:
                                     content_hash=hashlib.sha256(absolute.read_bytes()).hexdigest(),
                                 )
                             )
+
+    def request_approval(
+        self,
+        task: Task,
+        sequence: int,
+        action: AgentAction,
+        *,
+        action_fingerprint: str,
+        rule: str,
+        reason: str,
+    ) -> int:
+        with self.sessions.begin() as session:
+            step = StepRow(
+                task_id=str(task.id),
+                sequence=sequence,
+                status=StepStatus.PENDING.value,
+                action=action.model_dump(mode="json"),
+                result=None,
+                idempotency_key=None,
+                workspace_hash_before=None,
+                workspace_hash_after=None,
+                started_at=utc_now(),
+                finished_at=None,
+            )
+            session.add(step)
+            session.flush()
+            session.add(
+                ApprovalRow(
+                    task_id=str(task.id),
+                    step_id=step.id,
+                    action_fingerprint=action_fingerprint,
+                    status="PENDING",
+                    rule=rule,
+                    reason=reason,
+                    rejection_reason=None,
+                    created_at=utc_now(),
+                    decided_at=None,
+                )
+            )
+            task_row = session.get(TaskRow, str(task.id))
+            task_row.status = TaskStatus.WAITING_APPROVAL.value
+            task_row.updated_at = utc_now()
+            return step.id
+
+    def consume_approval(self, task_id: str, action_fingerprint: str) -> bool:
+        with self.sessions.begin() as session:
+            approval = session.scalars(
+                select(ApprovalRow)
+                .where(
+                    ApprovalRow.task_id == task_id,
+                    ApprovalRow.action_fingerprint == action_fingerprint,
+                    ApprovalRow.status == "APPROVED",
+                )
+                .order_by(ApprovalRow.id.desc())
+            ).first()
+            if approval is None:
+                return False
+            approval.status = "CONSUMED"
+            step = session.get(StepRow, approval.step_id)
+            step.status = StepStatus.INTERRUPTED.value
+            step.finished_at = utc_now()
+            return True
+
+    def decide_approval(
+        self, task_id: str, step_id: int, *, approved: bool, rejection_reason: str | None = None
+    ) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            approval = session.scalar(
+                select(ApprovalRow).where(
+                    ApprovalRow.task_id == task_id, ApprovalRow.step_id == step_id
+                )
+            )
+            if approval is None:
+                raise KeyError(step_id)
+            if approval.status != "PENDING":
+                raise ValueError("Approval has already been decided")
+            approval.status = "APPROVED" if approved else "REJECTED"
+            approval.rejection_reason = rejection_reason
+            approval.decided_at = utc_now()
+            task = session.get(TaskRow, task_id)
+            task.status = TaskStatus.PENDING.value
+            task.updated_at = utc_now()
+            if not approved:
+                step = session.get(StepRow, step_id)
+                result = ToolResult(
+                    success=False,
+                    error_type="policy_rejected",
+                    error_message=rejection_reason or "Action rejected by operator",
+                    metadata={"approval_step_id": step_id, "policy_rule": approval.rule},
+                ).model_dump(mode="json")
+                step.status = StepStatus.FAILED.value
+                step.result = result
+                step.finished_at = utc_now()
+                position = len(
+                    session.scalars(select(MessageRow).where(MessageRow.task_id == task_id)).all()
+                )
+                session.add_all(
+                    [
+                        MessageRow(
+                            task_id=task_id,
+                            position=position,
+                            payload={"role": "assistant", "content": step.action},
+                        ),
+                        MessageRow(
+                            task_id=task_id,
+                            position=position + 1,
+                            payload={
+                                "role": "tool",
+                                "name": step.action.get("tool_name", "policy"),
+                                "content": result,
+                            },
+                        ),
+                    ]
+                )
+            return self._approval_payload(approval)
+
+    def list_approvals(self, task_id: str) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            rows = session.scalars(
+                select(ApprovalRow).where(ApprovalRow.task_id == task_id).order_by(ApprovalRow.id)
+            ).all()
+            return [self._approval_payload(row) for row in rows]
+
+    @staticmethod
+    def _approval_payload(row: ApprovalRow) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "task_id": row.task_id,
+            "step_id": row.step_id,
+            "action_fingerprint": row.action_fingerprint,
+            "status": row.status,
+            "rule": row.rule,
+            "reason": row.reason,
+            "rejection_reason": row.rejection_reason,
+            "created_at": row.created_at.isoformat(),
+            "decided_at": row.decided_at.isoformat() if row.decided_at else None,
+        }
 
     def replace_messages(self, task_id: str, messages: list[dict[str, Any]]) -> None:
         with self.sessions.begin() as session:

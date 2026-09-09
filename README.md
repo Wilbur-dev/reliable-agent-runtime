@@ -4,7 +4,7 @@ A lightweight single-agent runtime built around explicit action schemas and cont
 
 ## Current milestone
 
-Phase 4 adds durable task execution and an HTTP API around the controlled loop:
+Phase 5 adds policy approval and Docker-contained command execution to the durable runtime:
 
 - a validated tool registry;
 - workspace-scoped `list_files`, `search_text`, and `read_file` tools;
@@ -23,6 +23,10 @@ Phase 4 adds durable task execution and an HTTP API around the controlled loop:
 - transactional `PENDING -> RUNNING -> SUCCEEDED/FAILED` step checkpoints;
 - startup recovery of interrupted work with workspace-hash-based mutation detection;
 - FastAPI endpoints for task creation, execution, inspection, cancellation, and health checks.
+- deterministic `ALLOW`, `DENY`, and `REQUIRE_APPROVAL` policy decisions before execution;
+- step-bound approval/rejection records, with rejection feedback returned to the agent context;
+- ephemeral non-root Docker command execution with no network, a read-only root filesystem,
+  CPU/memory/PIDs limits, timeout cleanup, and a single workspace bind mount.
 
 ## Run the phase 1 demo
 
@@ -117,6 +121,9 @@ POST /tasks
 POST /tasks/{id}/run
 GET  /tasks/{id}
 GET  /tasks/{id}/steps
+GET  /tasks/{id}/approvals
+POST /tasks/{id}/approve   {"step_id": 1}
+POST /tasks/{id}/reject    {"step_id": 1, "reason": "..."}
 POST /tasks/{id}/cancel
 GET  /health
 ```
@@ -124,6 +131,25 @@ GET  /health
 The API fixture accepts deterministic `fake_actions` so interruption and recovery behavior can be
 reproduced in integration tests. Model-provider configuration can be injected above the same
 Runtime service without changing the persistence schema.
+
+## Build the Phase 5 command sandbox
+
+```bash
+docker build \
+  -t reliable-agent-runtime-sandbox:phase5 \
+  -f docker/Dockerfile.sandbox .
+```
+
+Write tasks use the sandbox by default. The bundled image intentionally contains only Python's
+standard library and supports the default `unittest` and `compileall` command profiles. Build a
+project-specific image and pass `sandbox_image` when pytest, Ruff, compilers, or application
+dependencies are required. The runtime accepts a configured command name and argv; it does not
+accept arbitrary shell strings.
+
+This Docker boundary reduces accidental host impact and makes resource controls reproducible. It
+is not a production-grade sandbox for actively malicious code: Docker daemon access remains
+privileged infrastructure, the workspace is intentionally writable, and deployments still need
+host hardening, image provenance controls, and an external isolation boundary.
 
 ## Verify
 

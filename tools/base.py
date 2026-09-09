@@ -3,11 +3,23 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Protocol
 
 from pydantic import BaseModel
 
 from runtime.models import ToolResult
+
+
+class CommandRunner(Protocol):
+    async def run(
+        self,
+        argv: Sequence[str],
+        *,
+        context: ToolContext,
+        timeout_seconds: float,
+        stdin: bytes | None = None,
+        max_output_chars: int = 30_000,
+    ) -> ToolResult: ...
 
 
 class ToolContext:
@@ -16,11 +28,13 @@ class ToolContext:
         workspace: str | Path,
         *,
         protected_paths: Sequence[str] = ("tests",),
+        command_runner: CommandRunner | None = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve(strict=True)
         if not self.workspace.is_dir():
             raise ValueError(f"Workspace is not a directory: {self.workspace}")
         self.protected_paths = tuple(Path(path).as_posix().rstrip("/") for path in protected_paths)
+        self.command_runner = command_runner
 
     def resolve_path(self, raw_path: str) -> Path:
         candidate = Path(raw_path)

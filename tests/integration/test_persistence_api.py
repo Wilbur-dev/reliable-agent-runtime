@@ -218,6 +218,7 @@ def test_restart_continues_write_task_through_verification(tmp_path) -> None:
         task,
         runtime_config={
             "mode": "write",
+            "sandbox": False,
             "fake_actions": [action.model_dump(mode="json") for action in actions],
         },
     )
