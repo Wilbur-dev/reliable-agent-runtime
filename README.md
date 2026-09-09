@@ -4,7 +4,7 @@ A lightweight single-agent runtime built around explicit action schemas and cont
 
 ## Current milestone
 
-Phase 3 adds reliability controls around the code-modification and verification loop:
+Phase 4 adds durable task execution and an HTTP API around the controlled loop:
 
 - a validated tool registry;
 - workspace-scoped `list_files`, `search_text`, and `read_file` tools;
@@ -18,6 +18,11 @@ Phase 3 adds reliability controls around the code-modification and verification 
 - action fingerprinting, repeated-action detection, consecutive-failure circuit breaking, and
   no-progress termination;
 - explicit termination reasons and structured retry evidence.
+- SQLite/SQLAlchemy records for tasks, steps, messages, tool executions, artifacts, and
+  verification results;
+- transactional `PENDING -> RUNNING -> SUCCEEDED/FAILED` step checkpoints;
+- startup recovery of interrupted work with workspace-hash-based mutation detection;
+- FastAPI endpoints for task creation, execution, inspection, cancellation, and health checks.
 
 ## Run the phase 1 demo
 
@@ -98,6 +103,27 @@ reliable-agent \
 
 Prices are explicit USD-per-million-token inputs. They are never fetched implicitly, so historical
 experiments retain the estimation rule that produced their cost totals.
+
+## Run the Phase 4 API
+
+```bash
+uvicorn app.api.main:app --host 127.0.0.1 --port 8080
+```
+
+Core endpoints:
+
+```text
+POST /tasks
+POST /tasks/{id}/run
+GET  /tasks/{id}
+GET  /tasks/{id}/steps
+POST /tasks/{id}/cancel
+GET  /health
+```
+
+The API fixture accepts deterministic `fake_actions` so interruption and recovery behavior can be
+reproduced in integration tests. Model-provider configuration can be injected above the same
+Runtime service without changing the persistence schema.
 
 ## Verify
 

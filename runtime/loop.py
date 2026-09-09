@@ -63,6 +63,12 @@ class InMemoryAgentLoop:
         tool_context: ToolContext | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        checkpoint_store: Any | None = None,
+        resume_messages: list[dict[str, Any]] | None = None,
+        sequence_offset: int = 0,
+        initial_metrics: dict[str, Any] | None = None,
+        initial_tool_call_count: int = 0,
+        history_steps: list[AgentStepRecord] | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -70,11 +76,17 @@ class InMemoryAgentLoop:
         self.tool_context = tool_context
         self.clock = clock
         self.sleep = sleep
+        self.checkpoint_store = checkpoint_store
+        self.resume_messages = resume_messages
+        self.sequence_offset = sequence_offset
+        self.initial_metrics = initial_metrics or {}
+        self.initial_tool_call_count = initial_tool_call_count
+        self.history_steps = history_steps or []
 
     async def run(self, task: Task) -> AgentRunResult:
         task.status = TaskStatus.RUNNING
         context = self.tool_context or ToolContext(task.workspace)
-        messages: list[dict[str, Any]] = [
+        messages: list[dict[str, Any]] = self.resume_messages or [
             {
                 "role": "system",
                 "content": (
@@ -99,33 +111,65 @@ class InMemoryAgentLoop:
         steps: list[AgentStepRecord] = []
         verifications: list[VerificationResult] = []
         started_at = self.clock()
-        total_input_tokens = 0
-        total_output_tokens = 0
-        total_cost = 0.0
-        llm_retry_count = 0
+        total_input_tokens = int(self.initial_metrics.get("input_tokens", 0))
+        total_output_tokens = int(self.initial_metrics.get("output_tokens", 0))
+        total_cost = float(self.initial_metrics.get("estimated_cost_usd", 0.0))
+        llm_retry_count = int(self.initial_metrics.get("llm_retry_count", 0))
         retry_events: list[RetryEvent] = []
         detector = RunawayDetector()
+        prior_elapsed = float(self.initial_metrics.get("elapsed_seconds", 0.0))
+
+        def elapsed() -> float:
+            return prior_elapsed + max(0.0, self.clock() - started_at)
+
+        if self.checkpoint_store is not None:
+            self.checkpoint_store.set_task_status(str(task.id), TaskStatus.RUNNING)
+            self.checkpoint_store.replace_messages(str(task.id), messages)
 
         def finish_result(
             *, summary: str | None = None, error: str | None = None
         ) -> AgentRunResult:
-            return AgentRunResult(
+            result = AgentRunResult(
                 task=task,
                 summary=summary,
                 steps=steps,
                 messages=messages,
                 verifications=verifications,
                 error=error,
-                elapsed_seconds=max(0.0, self.clock() - started_at),
+                elapsed_seconds=elapsed(),
                 total_input_tokens=total_input_tokens,
                 total_output_tokens=total_output_tokens,
                 total_estimated_cost_usd=total_cost,
                 llm_retry_count=llm_retry_count,
                 retry_events=retry_events,
             )
+            if self.checkpoint_store is not None:
+                self.checkpoint_store.replace_messages(str(task.id), messages)
+                self.checkpoint_store.set_task_status(
+                    str(task.id),
+                    task.status,
+                    termination_reason=(
+                        task.termination_reason.value if task.termination_reason else None
+                    ),
+                    metrics={
+                        "elapsed_seconds": result.elapsed_seconds,
+                        "input_tokens": total_input_tokens,
+                        "output_tokens": total_output_tokens,
+                        "estimated_cost_usd": total_cost,
+                        "llm_retry_count": llm_retry_count,
+                    },
+                )
+            return result
 
-        for sequence in range(1, task.budget.max_steps + 1):
-            if self.clock() - started_at >= task.budget.max_wall_time:
+        start_sequence = self.sequence_offset + 1
+        for sequence in range(start_sequence, task.budget.max_steps + 1):
+            if self.checkpoint_store is not None and self.checkpoint_store.is_cancelled(
+                str(task.id)
+            ):
+                task.status = TaskStatus.CANCELLED
+                task.termination_reason = TerminationReason.CANCELLED
+                return finish_result()
+            if elapsed() >= task.budget.max_wall_time:
                 task.status = TaskStatus.BUDGET_EXCEEDED
                 task.termination_reason = TerminationReason.MAX_WALL_TIME
                 return finish_result()
@@ -153,7 +197,7 @@ class InMemoryAgentLoop:
                             delay_seconds=delay,
                         )
                     )
-                    if self.clock() - started_at + delay >= task.budget.max_wall_time:
+                    if elapsed() + delay >= task.budget.max_wall_time:
                         task.status = TaskStatus.BUDGET_EXCEEDED
                         task.termination_reason = TerminationReason.MAX_WALL_TIME
                         return finish_result(error=f"{exc.error_type}: retry budget exhausted")
@@ -181,12 +225,17 @@ class InMemoryAgentLoop:
                 task.status = TaskStatus.BUDGET_EXCEEDED
                 task.termination_reason = TerminationReason.MAX_COST
                 return finish_result()
-            if self.clock() - started_at >= task.budget.max_wall_time:
+            if elapsed() >= task.budget.max_wall_time:
                 task.status = TaskStatus.BUDGET_EXCEEDED
                 task.termination_reason = TerminationReason.MAX_WALL_TIME
                 return finish_result()
 
             if isinstance(action, FinishAction):
+                checkpoint_step_id = None
+                if self.checkpoint_store is not None:
+                    checkpoint_step_id = self.checkpoint_store.begin_step(
+                        task, sequence, action, mutates=False
+                    )
                 steps.append(
                     AgentStepRecord(
                         sequence=sequence,
@@ -196,16 +245,28 @@ class InMemoryAgentLoop:
                         model_metadata=response.raw_metadata,
                     )
                 )
+                if checkpoint_step_id is not None:
+                    self.checkpoint_store.finish_step(
+                        checkpoint_step_id, None, task=task, mutates=False
+                    )
                 if not self.verifiers:
                     task.status = TaskStatus.COMPLETED
                     task.termination_reason = TerminationReason.MODEL_FINISH
                     return finish_result(summary=action.summary)
 
                 current_verifications = [
-                    await verifier.verify(task=task, context=context, steps=steps)
+                    await verifier.verify(
+                        task=task, context=context, steps=[*self.history_steps, *steps]
+                    )
                     for verifier in self.verifiers
                 ]
                 verifications.extend(current_verifications)
+                if self.checkpoint_store is not None:
+                    self.checkpoint_store.save_verifications(
+                        str(task.id),
+                        sequence,
+                        [result.model_dump(mode="json") for result in current_verifications],
+                    )
                 if all(result.success for result in current_verifications):
                     task.status = TaskStatus.COMPLETED
                     task.termination_reason = TerminationReason.VERIFIED_COMPLETE
@@ -228,17 +289,32 @@ class InMemoryAgentLoop:
                         },
                     ]
                 )
+                if self.checkpoint_store is not None:
+                    self.checkpoint_store.replace_messages(str(task.id), messages)
                 continue
 
             if not isinstance(action, ToolCallAction):
                 raise TypeError(f"Unsupported action: {type(action).__name__}")
 
-            tool_calls = sum(isinstance(step.action, ToolCallAction) for step in steps)
+            tool_calls = self.initial_tool_call_count + sum(
+                isinstance(step.action, ToolCallAction) for step in steps
+            )
             if tool_calls >= task.budget.max_tool_calls:
                 task.status = TaskStatus.BUDGET_EXCEEDED
                 task.termination_reason = TerminationReason.MAX_TOOL_CALLS
                 break
 
+            # A PENDING and then RUNNING row is committed before any tool side effect.
+            checkpoint_step_id = None
+            mutates = False
+            if self.checkpoint_store is not None:
+                try:
+                    mutates = self.tool_registry.get(action.tool_name).mutates_environment
+                except LookupError:
+                    mutates = False
+                checkpoint_step_id = self.checkpoint_store.begin_step(
+                    task, sequence, action, mutates=mutates
+                )
             result = await self.tool_registry.execute(
                 action.tool_name,
                 action.arguments,
@@ -254,6 +330,10 @@ class InMemoryAgentLoop:
                     model_metadata=response.raw_metadata,
                 )
             )
+            if checkpoint_step_id is not None:
+                self.checkpoint_store.finish_step(
+                    checkpoint_step_id, result, task=task, mutates=mutates
+                )
             consecutive_failures, no_progress_steps = detector.observe_result(action, result)
             messages.extend(
                 [
@@ -265,7 +345,9 @@ class InMemoryAgentLoop:
                     },
                 ]
             )
-            if self.clock() - started_at >= task.budget.max_wall_time:
+            if self.checkpoint_store is not None:
+                self.checkpoint_store.replace_messages(str(task.id), messages)
+            if elapsed() >= task.budget.max_wall_time:
                 task.status = TaskStatus.BUDGET_EXCEEDED
                 task.termination_reason = TerminationReason.MAX_WALL_TIME
                 return finish_result()
