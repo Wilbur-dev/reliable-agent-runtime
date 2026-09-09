@@ -4,7 +4,7 @@ A lightweight single-agent runtime built around explicit action schemas and cont
 
 ## Current milestone
 
-Phase 5 adds policy approval and Docker-contained command execution to the durable runtime:
+Phase 6 adds bounded model context and operational observability to the durable runtime:
 
 - a validated tool registry;
 - workspace-scoped `list_files`, `search_text`, and `read_file` tools;
@@ -27,6 +27,13 @@ Phase 5 adds policy approval and Docker-contained command execution to the durab
 - step-bound approval/rejection records, with rejection feedback returned to the agent context;
 - ephemeral non-root Docker command execution with no network, a read-only root filesystem,
   CPU/memory/PIDs limits, timeout cleanup, and a single workspace bind mount.
+- deterministic context compaction that preserves goals, constraints, acceptance criteria, recent
+  steps, failures, and changed paths while retaining the full trajectory in SQLite;
+- hash-addressed references for large tool outputs and stale-file detection for prior reads;
+- structured runtime events for model calls, tool execution, retries, policies, compaction, and
+  termination;
+- Prometheus metrics for task outcomes, duration, tools, tokens, budgets, verification failures,
+  and context compaction.
 
 ## Run the phase 1 demo
 
@@ -122,10 +129,14 @@ POST /tasks/{id}/run
 GET  /tasks/{id}
 GET  /tasks/{id}/steps
 GET  /tasks/{id}/approvals
+GET  /tasks/{id}/context-compactions
+GET  /tasks/{id}/events
+GET  /tasks/{id}/results/{result_id}
 POST /tasks/{id}/approve   {"step_id": 1}
 POST /tasks/{id}/reject    {"step_id": 1, "reason": "..."}
 POST /tasks/{id}/cancel
 GET  /health
+GET  /metrics
 ```
 
 The API fixture accepts deterministic `fake_actions` so interruption and recovery behavior can be

@@ -3,15 +3,17 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from llm.fake import FakeLLMClient
 from persistence.database import SQLiteStore
 from policies.engine import PolicyEngine
 from runtime.actions import AgentAction
+from runtime.context import ContextBuilder, ContextConfig
 from runtime.loop import AgentStepRecord, InMemoryAgentLoop
 from runtime.models import BudgetConfig, Task, TaskStatus, TerminationReason, ToolResult
+from runtime.observability import RuntimeMetrics
 from sandbox.docker import DockerCommandRunner, DockerSandboxConfig
 from tools.base import ToolContext
 from tools.development import ApplyPatchTool, GitDiffTool, RunLinterTool, RunTestsTool
@@ -34,6 +36,7 @@ class CreateTaskRequest(StrictModel):
     fake_actions: list[AgentAction] = Field(default_factory=list)
     sandbox: bool = True
     sandbox_image: str = "reliable-agent-runtime-sandbox:phase5"
+    context: ContextConfig = Field(default_factory=ContextConfig)
 
 
 class CancelResponse(StrictModel):
@@ -50,8 +53,9 @@ class RejectionRequest(ApprovalRequest):
 
 
 class RuntimeService:
-    def __init__(self, store: SQLiteStore) -> None:
+    def __init__(self, store: SQLiteStore, metrics: RuntimeMetrics | None = None) -> None:
         self.store = store
+        self.metrics = metrics or RuntimeMetrics()
         self.locks: dict[str, asyncio.Lock] = {}
         self.recovered_task_ids = store.recover_interrupted()
 
@@ -70,8 +74,10 @@ class RuntimeService:
                 "fake_actions": [action.model_dump(mode="json") for action in request.fake_actions],
                 "sandbox": request.sandbox,
                 "sandbox_image": request.sandbox_image,
+                "context": request.context.model_dump(mode="json"),
             },
         )
+        self.metrics.observe_task_created()
         return task
 
     async def run(self, task_id: str) -> Task:
@@ -168,8 +174,12 @@ class RuntimeService:
                 ),
                 history_steps=history_steps,
                 policy_engine=PolicyEngine(),
+                context_builder=ContextBuilder(
+                    ContextConfig.model_validate(config.get("context", {}))
+                ),
             )
             result = await loop.run(task)
+            self.metrics.observe_run(result, initial_metrics=record["metrics"] if record else {})
             return result.task
 
     def cancel(self, task_id: str) -> Task:
@@ -199,7 +209,7 @@ class RuntimeService:
 
 
 def create_app(database_url: str = "sqlite:///reliable_agent.db") -> FastAPI:
-    app = FastAPI(title="Reliable Agent Runtime", version="0.5.0")
+    app = FastAPI(title="Reliable Agent Runtime", version="0.6.0")
     service = RuntimeService(SQLiteStore(database_url))
     app.state.runtime_service = service
 
@@ -211,6 +221,13 @@ def create_app(database_url: str = "sqlite:///reliable_agent.db") -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, object]:
         return {"status": "ok", "recovered_tasks": len(service.recovered_task_ids)}
+
+    @app.get("/metrics")
+    def metrics(runtime: RuntimeService = service_dependency) -> Response:
+        return Response(
+            content=runtime.metrics.render(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     @app.post("/tasks", status_code=status.HTTP_201_CREATED)
     def create_task(
@@ -241,6 +258,35 @@ def create_app(database_url: str = "sqlite:///reliable_agent.db") -> FastAPI:
         if runtime.store.get_task(task_id) is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
         return runtime.store.list_approvals(task_id)
+
+    @app.get("/tasks/{task_id}/context-compactions")
+    def get_context_compactions(
+        task_id: str, runtime: RuntimeService = service_dependency
+    ) -> list[dict[str, object]]:
+        if runtime.store.get_task(task_id) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
+        return runtime.store.list_context_compactions(task_id)
+
+    @app.get("/tasks/{task_id}/events")
+    def get_events(
+        task_id: str, runtime: RuntimeService = service_dependency
+    ) -> list[dict[str, object]]:
+        if runtime.store.get_task(task_id) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
+        return runtime.store.list_events(task_id)
+
+    @app.get("/tasks/{task_id}/results/{result_id}")
+    def get_full_result(
+        task_id: str,
+        result_id: str,
+        runtime: RuntimeService = service_dependency,
+    ) -> dict[str, str]:
+        if runtime.store.get_task(task_id) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
+        output = runtime.store.get_tool_output(task_id, result_id)
+        if output is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Tool result not found")
+        return {"result_id": result_id, "output": output}
 
     @app.post("/tasks/{task_id}/run")
     async def run_task(
