@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 reliable-agent = "app.cli:main"
+reliable-agent-eval = "evaluator.cli:main"
 
 [project.optional-dependencies]
 dev = [

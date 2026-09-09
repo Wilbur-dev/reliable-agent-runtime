@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
@@ -208,9 +209,11 @@ class RuntimeService:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 
-def create_app(database_url: str = "sqlite:///reliable_agent.db") -> FastAPI:
+def create_app(database_url: str | None = None) -> FastAPI:
     app = FastAPI(title="Reliable Agent Runtime", version="0.6.0")
-    service = RuntimeService(SQLiteStore(database_url))
+    service = RuntimeService(
+        SQLiteStore(database_url or os.environ.get("DATABASE_URL", "sqlite:///reliable_agent.db"))
+    )
     app.state.runtime_service = service
 
     def get_service() -> RuntimeService:

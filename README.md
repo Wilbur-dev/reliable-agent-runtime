@@ -169,3 +169,15 @@ pytest
 ruff check .
 ruff format --check .
 ```
+
+## Run the evaluation
+
+Validate the fixed 30-task manifest locally:
+
+```bash
+python -m evaluator.cli validate --tasks evaluation/tasks/tasks.json
+sh scripts/smoke_evaluation.sh
+```
+
+Real-model results compare Single Call, Basic Loop, Guarded Runtime, and Reliable Runtime using the
+same task contract. See `evaluation/README.md` for smoke, matrix, raw-record, and summary commands.

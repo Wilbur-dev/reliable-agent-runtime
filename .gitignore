@@ -19,3 +19,12 @@ evaluation/results/*
 !evaluation/results/phase4_acceptance.md
 !evaluation/results/phase5_acceptance.md
 !evaluation/results/phase6_acceptance.md
+!evaluation/results/phase7_acceptance.md
+!evaluation/results/phase7-summary/
+!evaluation/results/phase7-summary/summary.json
+!evaluation/results/phase7-summary/summary.csv
+!evaluation/results/raw/
+evaluation/results/raw/*
+!evaluation/results/raw/e4f9b81b1aee45ffb7da22e4503953ad/
+evaluation/results/raw/e4f9b81b1aee45ffb7da22e4503953ad/*
+!evaluation/results/raw/e4f9b81b1aee45ffb7da22e4503953ad/records.json
