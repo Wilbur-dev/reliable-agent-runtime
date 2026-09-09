@@ -168,6 +168,13 @@ class ConfiguredCommandTool(Tool):
         argv = self.commands.get(args.command_name)
         if argv is None:
             raise CommandNotAllowedError(f"Command is not configured: {args.command_name}")
+        if context.command_runner is not None:
+            return await context.command_runner.run(
+                argv,
+                context=context,
+                timeout_seconds=self.timeout_seconds,
+                max_output_chars=self.max_output_chars,
+            )
         return await _run_process(
             argv,
             context=context,

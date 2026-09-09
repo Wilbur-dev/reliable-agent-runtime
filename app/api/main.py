@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -9,9 +8,11 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from llm.fake import FakeLLMClient
 from persistence.database import SQLiteStore
+from policies.engine import PolicyEngine
 from runtime.actions import AgentAction
 from runtime.loop import AgentStepRecord, InMemoryAgentLoop
 from runtime.models import BudgetConfig, Task, TaskStatus, TerminationReason, ToolResult
+from sandbox.docker import DockerCommandRunner, DockerSandboxConfig
 from tools.base import ToolContext
 from tools.development import ApplyPatchTool, GitDiffTool, RunLinterTool, RunTestsTool
 from tools.readonly import ListFilesTool, ReadFileTool, SearchTextTool
@@ -31,11 +32,21 @@ class CreateTaskRequest(StrictModel):
     constraints: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
     fake_actions: list[AgentAction] = Field(default_factory=list)
+    sandbox: bool = True
+    sandbox_image: str = "reliable-agent-runtime-sandbox:phase5"
 
 
 class CancelResponse(StrictModel):
     id: str
     status: TaskStatus
+
+
+class ApprovalRequest(StrictModel):
+    step_id: int = Field(gt=0)
+
+
+class RejectionRequest(ApprovalRequest):
+    reason: str = Field(min_length=1, max_length=2000)
 
 
 class RuntimeService:
@@ -57,6 +68,8 @@ class RuntimeService:
             runtime_config={
                 "mode": request.mode,
                 "fake_actions": [action.model_dump(mode="json") for action in request.fake_actions],
+                "sandbox": request.sandbox,
+                "sandbox_image": request.sandbox_image,
             },
         )
         return task
@@ -71,6 +84,11 @@ class RuntimeService:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
             if task.status is TaskStatus.CANCELLED:
                 raise HTTPException(status.HTTP_409_CONFLICT, "Task was cancelled")
+            if task.status is TaskStatus.WAITING_APPROVAL:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Task is waiting for an approval decision",
+                )
             config = self.store.get_runtime_config(task_id)
             actions = config.get("fake_actions", [])
             steps = self.store.list_steps(task_id)
@@ -82,12 +100,28 @@ class RuntimeService:
             tools = [ListFilesTool(), ReadFileTool(), SearchTextTool()]
             verifiers = []
             if config.get("mode") == "write":
+                if config.get("sandbox", True):
+                    test_commands = {
+                        "unittest": (
+                            "python",
+                            "-B",
+                            "-m",
+                            "unittest",
+                            "discover",
+                            "-s",
+                            "tests",
+                        )
+                    }
+                    lint_commands = {"compileall": ("python", "-B", "-m", "compileall", "-q", ".")}
+                else:
+                    test_commands = {"pytest": ("python", "-B", "-m", "pytest", "-q")}
+                    lint_commands = {"ruff": ("python", "-m", "ruff", "check", ".")}
                 tools.extend(
                     [
                         ApplyPatchTool(),
                         GitDiffTool(),
-                        RunTestsTool({"pytest": (sys.executable, "-B", "-m", "pytest", "-q")}),
-                        RunLinterTool({"ruff": (sys.executable, "-m", "ruff", "check", ".")}),
+                        RunTestsTool(test_commands),
+                        RunLinterTool(lint_commands),
                     ]
                 )
                 verifiers = [
@@ -109,11 +143,20 @@ class RuntimeService:
                 for row in steps
                 if row["status"] in {"SUCCEEDED", "FAILED"}
             ]
+            command_runner = None
+            if config.get("mode") == "write" and config.get("sandbox", True):
+                command_runner = DockerCommandRunner(
+                    DockerSandboxConfig(image=config.get("sandbox_image"))
+                )
             loop = InMemoryAgentLoop(
                 FakeLLMClient(remaining),
                 ToolRegistry(tools),
                 verifiers=verifiers,
-                tool_context=ToolContext(Path(task.workspace), protected_paths=("tests",)),
+                tool_context=ToolContext(
+                    Path(task.workspace),
+                    protected_paths=("tests",),
+                    command_runner=command_runner,
+                ),
                 checkpoint_store=self.store,
                 resume_messages=messages,
                 sequence_offset=max((row["sequence"] for row in steps), default=0),
@@ -124,6 +167,7 @@ class RuntimeService:
                     for row in steps
                 ),
                 history_steps=history_steps,
+                policy_engine=PolicyEngine(),
             )
             result = await loop.run(task)
             return result.task
@@ -139,9 +183,23 @@ class RuntimeService:
         )
         return self.store.get_task(task_id)
 
+    def decide_approval(
+        self, task_id: str, step_id: int, *, approved: bool, reason: str | None = None
+    ) -> dict[str, object]:
+        if self.store.get_task(task_id) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
+        try:
+            return self.store.decide_approval(
+                task_id, step_id, approved=approved, rejection_reason=reason
+            )
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Approval step not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
 
 def create_app(database_url: str = "sqlite:///reliable_agent.db") -> FastAPI:
-    app = FastAPI(title="Reliable Agent Runtime", version="0.4.0")
+    app = FastAPI(title="Reliable Agent Runtime", version="0.5.0")
     service = RuntimeService(SQLiteStore(database_url))
     app.state.runtime_service = service
 
@@ -176,6 +234,14 @@ def create_app(database_url: str = "sqlite:///reliable_agent.db") -> FastAPI:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
         return runtime.store.list_steps(task_id)
 
+    @app.get("/tasks/{task_id}/approvals")
+    def get_approvals(
+        task_id: str, runtime: RuntimeService = service_dependency
+    ) -> list[dict[str, object]]:
+        if runtime.store.get_task(task_id) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
+        return runtime.store.list_approvals(task_id)
+
     @app.post("/tasks/{task_id}/run")
     async def run_task(
         task_id: str, runtime: RuntimeService = service_dependency
@@ -186,6 +252,24 @@ def create_app(database_url: str = "sqlite:///reliable_agent.db") -> FastAPI:
     def cancel_task(task_id: str, runtime: RuntimeService = service_dependency) -> CancelResponse:
         task = runtime.cancel(task_id)
         return CancelResponse(id=str(task.id), status=task.status)
+
+    @app.post("/tasks/{task_id}/approve")
+    def approve_task(
+        task_id: str,
+        request: ApprovalRequest,
+        runtime: RuntimeService = service_dependency,
+    ) -> dict[str, object]:
+        return runtime.decide_approval(task_id, request.step_id, approved=True)
+
+    @app.post("/tasks/{task_id}/reject")
+    def reject_task(
+        task_id: str,
+        request: RejectionRequest,
+        runtime: RuntimeService = service_dependency,
+    ) -> dict[str, object]:
+        return runtime.decide_approval(
+            task_id, request.step_id, approved=False, reason=request.reason
+        )
 
     return app
 

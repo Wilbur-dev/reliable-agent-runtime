@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from llm.base import LLMClient
 from llm.errors import LLMError
+from policies.engine import PolicyDecision, PolicyEngine
 from runtime.actions import AgentAction, FinishAction, LLMUsage, ToolCallAction
 from runtime.control import RunawayDetector
 from runtime.models import Task, TaskStatus, TerminationReason, ToolResult
@@ -69,6 +70,7 @@ class InMemoryAgentLoop:
         initial_metrics: dict[str, Any] | None = None,
         initial_tool_call_count: int = 0,
         history_steps: list[AgentStepRecord] | None = None,
+        policy_engine: PolicyEngine | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -82,6 +84,7 @@ class InMemoryAgentLoop:
         self.initial_metrics = initial_metrics or {}
         self.initial_tool_call_count = initial_tool_call_count
         self.history_steps = history_steps or []
+        self.policy_engine = policy_engine
 
     async def run(self, task: Task) -> AgentRunResult:
         task.status = TaskStatus.RUNNING
@@ -304,6 +307,43 @@ class InMemoryAgentLoop:
                 task.termination_reason = TerminationReason.MAX_TOOL_CALLS
                 break
 
+            policy_result = None
+            if self.policy_engine is not None:
+                try:
+                    policy_tool = self.tool_registry.get(action.tool_name)
+                except LookupError:
+                    policy_tool = None
+                policy_result = self.policy_engine.evaluate(
+                    action,
+                    tool=policy_tool,
+                    context=context,
+                    task_constraints=task.constraints,
+                )
+                if policy_result.decision is PolicyDecision.REQUIRE_APPROVAL:
+                    approved = bool(
+                        self.checkpoint_store
+                        and self.checkpoint_store.consume_approval(
+                            str(task.id), policy_result.action_fingerprint
+                        )
+                    )
+                    if not approved:
+                        if self.checkpoint_store is None:
+                            task.status = TaskStatus.FAILED
+                            task.termination_reason = TerminationReason.UNRECOVERABLE_ERROR
+                            return finish_result(
+                                error="Approval-required actions need a checkpoint store"
+                            )
+                        self.checkpoint_store.request_approval(
+                            task,
+                            sequence,
+                            action,
+                            action_fingerprint=policy_result.action_fingerprint,
+                            rule=policy_result.rule,
+                            reason=policy_result.reason,
+                        )
+                        task.status = TaskStatus.WAITING_APPROVAL
+                        return finish_result(summary=policy_result.reason)
+
             # A PENDING and then RUNNING row is committed before any tool side effect.
             checkpoint_step_id = None
             mutates = False
@@ -315,11 +355,19 @@ class InMemoryAgentLoop:
                 checkpoint_step_id = self.checkpoint_store.begin_step(
                     task, sequence, action, mutates=mutates
                 )
-            result = await self.tool_registry.execute(
-                action.tool_name,
-                action.arguments,
-                context,
-            )
+            if policy_result and policy_result.decision is PolicyDecision.DENY:
+                result = ToolResult(
+                    success=False,
+                    error_type="policy_denied",
+                    error_message=policy_result.reason,
+                    metadata={"policy_rule": policy_result.rule},
+                )
+            else:
+                result = await self.tool_registry.execute(
+                    action.tool_name,
+                    action.arguments,
+                    context,
+                )
             steps.append(
                 AgentStepRecord(
                     sequence=sequence,
