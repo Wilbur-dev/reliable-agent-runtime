@@ -3,17 +3,13 @@
 ## 0. 结论摘要
 
 Phase 2 已完成“受控代码写入闭环”的工程目标：Runtime 可以连接真实的
-OpenAI-compatible 模型服务，让模型读取仓库、提交补丁、运行白名单测试与
-linter，并且只在独立 Verifier 提供通过证据后把任务标记为完成。
+OpenAI-compatible 模型服务，让模型读取仓库、提交补丁、运行白名单测试与linter，并且只在独立 Verifier 提供通过证据后把任务标记为完成。
 
 验收分成两层，结论不能混为一谈：
 
-- **Runtime 能力验收通过**：36 项自动化测试通过；错误补丁、命令超时、
-  非白名单命令、受保护路径修改和虚假完成均有测试覆盖。
-- **真实服务集成验收通过**：Mac 上的 Runtime 已通过 SSH 隧道连接 AutoDL
-  上的 vLLM，真实完成了结构化工具调用、命令执行、失败证据回传和安全拦截。
-- **所选 1.5B 模型的任务成功率验收未通过**：模型能调用工具，但在失败恢复
-  阶段陷入重复输出，没有完成业务修复。Runtime 正确拒绝了它的完成声明。
+- **Runtime 能力验收通过**：36 项自动化测试通过；错误补丁、命令超时、非白名单命令、受保护路径修改和虚假完成均有测试覆盖。
+- **真实服务集成验收通过**：Mac 上的 Runtime 已通过 SSH 隧道连接 AutoDL上的 vLLM，真实完成了结构化工具调用、命令执行、失败证据回传和安全拦截。
+- **所选 1.5B 模型的任务成功率验收未通过**：模型能调用工具，但在失败恢复阶段陷入重复输出，没有完成业务修复。Runtime 正确拒绝了它的完成声明。
 
 因此，本报告的核心结论不是“模型修复成功”，而是：**Runtime 的闭环和安全
 边界按设计工作，并能可靠识别及记录弱模型失败。** 本项目不再追加更强模型
@@ -43,9 +39,7 @@ Phase 2 的目标是建立真实模型驱动的代码修改闭环：模型读取
 | Runtime/测试环境 | 本地 Mac；Conda `llm-inference-lab`；Python 3.11.13；httpx 0.28.1；Pydantic 2.13.5；pytest 9.1.1；Ruff 0.16.6 | 运行 Agent Loop、工具、Verifier、CLI 和全部自动化测试；通过 HTTP 调用远端模型 |
 | 模型推理环境 | AutoDL RTX 4090；vLLM 0.28.0；`Qwen/Qwen2.5-1.5B-Instruct`；最大上下文 8192 tokens；Hermes tool parser | 提供 OpenAI-compatible `/v1/chat/completions` 与结构化 tool calls |
 
-Conda 环境并不运行 vLLM，也不包含模型权重。它的作用是固定本地 Runtime 的
-Python 与依赖版本，保证测试和客户端行为可复现；vLLM 和模型运行在 AutoDL。
-两端通过 SSH 本地端口转发连接，验收时使用的 API 地址为
+Conda 环境并不运行 vLLM，也不包含模型权重。它的作用是固定本地 Runtime 的Python 与依赖版本，保证测试和客户端行为可复现；vLLM 和模型运行在 AutoDL。两端通过 SSH 本地端口转发连接，验收时使用的 API 地址为
 `http://127.0.0.1:8001/v1`，对应远端 `127.0.0.1:8000/v1`。
 
 ## 3. 确定性验收
@@ -71,9 +65,7 @@ Ruff: All checks passed
 Formatting: 41 files already formatted
 ```
 
-该轨迹的意义是验证 Runtime 逻辑，而不是评价某个模型：同一组动作可重复执行，
-能够证明失败的首次修复不会被误判为完成，只有第二次修复及全部外部证据通过后，
-状态才会变为 `VERIFIED_COMPLETE`。
+该轨迹的意义是验证 Runtime 逻辑，而不是评价某个模型：同一组动作可重复执行，能够证明失败的首次修复不会被误判为完成，只有第二次修复及全部外部证据通过后，状态才会变为 `VERIFIED_COMPLETE`。
 
 ## 4. 真实模型实验
 
@@ -88,8 +80,7 @@ Formatting: 41 files already formatted
 
 2026-09-09 最终复测使用隔离工作区
 `/private/tmp/rar-phase2-vllm.TTMoor`，任务 ID 为
-`ac1bea7c-ccc2-4f89-8eaa-6f3c03f60e87`。基线提交在实验开始前创建，
-因此模型产生的修改可以与原始 fixture 明确区分。
+`ac1bea7c-ccc2-4f89-8eaa-6f3c03f60e87`。基线提交在实验开始前创建，因此模型产生的修改可以与原始 fixture 明确区分。
 
 ### 4.1 验证通过的能力
 
@@ -106,14 +97,10 @@ Formatting: 41 files already formatted
 1. `git_diff` 成功，确认初始工作区无修改；
 2. `list_files` 成功，模型获得 `src/discount.py` 和测试文件的位置；
 3. `run_linter(ruff)` 退出码为 0；
-4. `run_tests(pytest)` 退出码为 1，两个断言明确显示 gold 折扣实际值为
-   `0.01`、期望值为 `0.10`；
-5. 模型随后反复输出“将搜索并修复”的完成文本，甚至生成了未被 Runtime
-   执行的伪工具调用；
+4. `run_tests(pytest)` 退出码为 1，两个断言明确显示 gold 折扣实际值为`0.01`、期望值为 `0.10`；
+5. 模型随后反复输出“将搜索并修复”的完成文本，甚至生成了未被 Runtime执行的伪工具调用；
 6. 每次 `finish` 都被 Verifier 拒绝，`tests/` 始终未被修改；
-7. 输入达到至少 7937 tokens，加上 256 个预留输出 tokens 后超过 8192，
-   vLLM 返回 HTTP 400；Runtime 最终记录为
-   `FAILED / UNRECOVERABLE_ERROR`。
+7. 输入达到至少 7937 tokens，加上 256 个预留输出 tokens 后超过 8192，vLLM 返回 HTTP 400；Runtime 最终记录为`FAILED / UNRECOVERABLE_ERROR`。
 
 ### 4.2 未通过的能力
 
@@ -125,15 +112,12 @@ Formatting: 41 files already formatted
 
 这是模型能力失败，不是 Runtime 把错误结果当成成功：
 
-- pytest 已把根因压缩为一个非常明确的差异：gold 实际为 `0.01`，期望为
-  `0.10`；
+- pytest 已把根因压缩为一个非常明确的差异：gold 实际为 `0.01`，期望为`0.10`；
 - 模型在自然语言中说自己将修复，却没有产生可执行的结构化 `apply_patch`；
-- Runtime 不信任自然语言声明，只信任工具结果与 Verifier，因此没有改变源文件，
-  也没有返回成功；
+- Runtime 不信任自然语言声明，只信任工具结果与 Verifier，因此没有改变源文件，也没有返回成功；
 - 最终状态、失败测试、模型输出和上下文超限错误都被保留下来，可用于复盘。
 
-对面试展示而言，这个案例体现了项目的关键设计取舍：LLM 负责提出动作，Runtime
-负责权限、执行和完成判定。模型可以失败，但系统不能把失败伪装成成功。
+对面试展示而言，这个案例体现了项目的关键设计取舍：LLM 负责提出动作，Runtime负责权限、执行和完成判定。模型可以失败，但系统不能把失败伪装成成功。
 
 ## 5. 最终验收判断
 
